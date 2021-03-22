@@ -2,6 +2,7 @@
 #include "bpf_helpers.h"
 
 char __license[] SEC("license") = "Dual MIT/GPL";
+u32 __version SEC("version")    = 266002;
 
 struct bpf_map_def SEC("maps") kprobe_map = {
     .type = BPF_MAP_TYPE_ARRAY,

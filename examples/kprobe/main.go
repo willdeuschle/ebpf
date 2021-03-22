@@ -8,16 +8,17 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
-	"unsafe"
+	"io/ioutil"
+	"strconv"
+	"strings"
 
-	goperf "github.com/elastic/go-perf"
 	"golang.org/x/sys/unix"
+	"github.com/cilium/ebpf"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-11 KProbeExample ./bpf/kprobe_example.c -- -I../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-11 -target bpf -tags linux KProbeExample ./bpf/kprobe_example.c -- -I../headers
 
 const mapKey uint32 = 0
 
@@ -33,20 +34,27 @@ func main() {
 		log.Fatalf("failed to set temporary rlimit: %v", err)
 	}
 
+	specs, err := LoadKProbeExample()
+	if err != nil {
+		log.Fatalf("failed to load kprobe %v", err)
+	}
+
 	// Load Program and Map
 	objs := KProbeExampleObjects{}
-	if err := LoadKProbeExampleObjects(&objs, nil); err != nil {
-		log.Fatalf("error while loading objects: %v", err)
+	if err := specs.LoadAndAssign(&objs, &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogLevel: 1,
+		},
+	}); err != nil {
+		log.Fatalf("failed to load and assign %v", err)
 	}
-	defer objs.Close()
 
 	// Create and attach __x64_sys_execve kprobe
-	efd, err := openKProbe("__x64_sys_execve", uint32(objs.KprobeExecve.FD()))
-	if err != nil {
-		log.Fatalf("create and attach KProbe: %v", err)
-
-	}
-	defer unix.Close(efd)
+    detachKprobe, err := attachKProbe(objs.KprobeExecve, "sys_execve", "sysexecve_probe")
+    if err != nil {
+        log.Fatalf("Failed to create and attach kprobe %v", err)
+    }
+    defer detachKprobe()
 
 	ticker := time.NewTicker(1 * time.Second)
 	for {
@@ -63,41 +71,86 @@ func main() {
 	}
 }
 
-func openKProbe(syscall string, fd uint32) (int, error) {
-	et, err := goperf.LookupEventType("kprobe")
+func attachKProbe(program *ebpf.Program, syscall, probeName string) (func(), error) {
+	if err := createKProbe(syscall, probeName, true); err != nil {
+		log.Printf("create kprobe error %v", err)
+		return nil, err
+	}
+
+	probeID, err := getKProbeID(probeName)
 	if err != nil {
-		return 0, fmt.Errorf("read PMU type: %v", err)
+		log.Printf("get kprobe id failure %v", err)
+		return nil, err
 	}
-
-	config1ptr := newStringPointer(syscall)
-	ev, err := goperf.Open(&goperf.Attr{Type: et, Config1: uint64(uintptr(config1ptr))}, goperf.AllThreads, 0, nil)
+	attr := unix.PerfEventAttr{
+		Type:        unix.PERF_TYPE_TRACEPOINT,
+		Config:      probeID,
+		Sample_type: unix.PERF_SAMPLE_RAW | unix.PERF_SAMPLE_CALLCHAIN,
+		Sample:      1,
+		Wakeup:      1,
+		Read_format: 0,
+	}
+	pfd, err := unix.PerfEventOpen(&attr, -1, 0, -1, unix.PERF_FLAG_FD_CLOEXEC|unix.PERF_FLAG_FD_NO_GROUP)
 	if err != nil {
-		return 0, fmt.Errorf("perf event open: %v", err)
+		log.Printf("unable to open perf event %v", err)
+		return nil, err
 	}
-	efd, err := ev.FD()
-	if err != nil {
-		return 0, fmt.Errorf("get perf event fd: %v", err)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(pfd), unix.PERF_EVENT_IOC_SET_BPF, uintptr(program.FD())); errno != 0 {
+		log.Printf("unable to set BPF perf prog %v", err)
+		return nil, err
 	}
-
-	// Ensure config1ptr is not finalized until goperf.Open returns.
-	runtime.KeepAlive(config1ptr)
-
-	if err := unix.IoctlSetInt(efd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
-		unix.Close(efd)
-		return 0, fmt.Errorf("perf event enable: %v", err)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(pfd), unix.PERF_EVENT_IOC_ENABLE, 0); errno != 0 {
+		log.Printf("unable to enable perf event %v", err)
+		return nil, err
 	}
 
-	if err := ev.SetBPF(fd); err != nil {
-		unix.Close(efd)
-		return 0, fmt.Errorf("perf event set bpf: %v", err)
-	}
-
-	return efd, nil
+	log.Printf("kprobe attached")
+	return func() {
+		if err := deleteKProbe(probeName); err != nil {
+			log.Printf("Failed to detach kprobe")
+		} else {
+			log.Printf("kprobe detached successfully")
+		}
+	}, nil
 }
 
-func newStringPointer(str string) unsafe.Pointer {
-	// The kernel expects strings to be zero terminated
-	buf := make([]byte, len(str)+1)
-	copy(buf, str)
-	return unsafe.Pointer(&buf[0])
+func deleteKProbe(name string) error {
+	msg := fmt.Sprintf("-:%s", name)
+	return writeKProbeEvents(msg)
+}
+
+func getKProbeID(name string) (uint64, error) {
+	fname := fmt.Sprintf("/sys/kernel/debug/tracing/events/kprobes/%s/id", name)
+	data, err := ioutil.ReadFile(fname)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read tracepoint ID for '%s': %v", name, err)
+	}
+	tid := strings.TrimSuffix(string(data), "\n")
+	return strconv.ParseUint(tid, 10, 64)
+}
+
+func createKProbe(syscall, probeName string, isReturn bool) error {
+	probeType := "p"
+	if isReturn {
+		probeType = "r"
+	}
+	msg := fmt.Sprintf("%s:%s %s", probeType, probeName, syscall)
+	fmt.Println("kprobe event", msg)
+
+	return writeKProbeEvents(msg)
+}
+
+func writeKProbeEvents(msg string) error {
+	f, err := os.OpenFile("/sys/kernel/debug/tracing/kprobe_events", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("fail opening")
+		return err
+	}
+	log.Printf("start writing")
+	if _, err := f.WriteString(msg); err != nil {
+		log.Printf("fail writing: %v", err)
+		return err
+	}
+	log.Printf("finish writing")
+	return f.Close()
 }
